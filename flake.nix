@@ -176,7 +176,7 @@ EOF
             architecture = triple.go;
             copyToRoot = fhs;
             config = {
-              Entrypoint = "/bin/aerogramme";
+              Entrypoint = [ "/bin/aerogramme" ];
               Cmd = [ "--dev" "provider" "daemon" ];
             };
           };
@@ -201,7 +201,7 @@ EOF
         ###
         tools = rec {
           version = cross.amd64.crate.version; # bind version on amd64 crate
-	  alba = albatros.packages.alba;
+	  alba = albatros.packages.${system}.alba;
           build = pkgs.writeScriptBin "aerogramme-build" ''
 #!/usr/bin/env bash
 set -euxo pipefail
