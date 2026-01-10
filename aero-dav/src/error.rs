@@ -1,4 +1,5 @@
 use quick_xml::events::attributes::AttrError;
+use quick_xml::encoding::EncodingError;
 
 #[derive(Debug)]
 pub enum ParsingError {
@@ -11,6 +12,7 @@ pub enum ParsingError {
     InvalidValue,
     Utf8Error(std::str::Utf8Error),
     QuickXml(quick_xml::Error),
+    QuickXmlEncodingError(EncodingError),
     Chrono(chrono::format::ParseError),
     Int(std::num::ParseIntError),
     Eof,
@@ -27,6 +29,7 @@ impl std::fmt::Display for ParsingError {
             Self::InvalidValue => write!(f, "Invalid value"),
             Self::Utf8Error(_) => write!(f, "Utf8 Error"),
             Self::QuickXml(_) => write!(f, "Quick XML error"),
+            Self::QuickXmlEncodingError(_) => write!(f, "Quick XML encoding error"),
             Self::Chrono(_) => write!(f, "Chrono error"),
             Self::Int(_) => write!(f, "Number parsing error"),
             Self::Eof => write!(f, "Found EOF while expecting data"),
@@ -42,6 +45,11 @@ impl From<AttrError> for ParsingError {
 impl From<quick_xml::Error> for ParsingError {
     fn from(value: quick_xml::Error) -> Self {
         Self::QuickXml(value)
+    }
+}
+impl From<EncodingError> for ParsingError {
+    fn from(value: EncodingError) -> Self {
+        Self::QuickXmlEncodingError(value)
     }
 }
 impl From<std::str::Utf8Error> for ParsingError {

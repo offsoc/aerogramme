@@ -5,231 +5,249 @@
     nixpkgs.url = "github:NixOS/nixpkgs/master";
     flake-utils.url = "github:numtide/flake-utils";
 
-    # this patched version of cargo2nix makes easier to use clippy for building
-    cargo2nix = {
-      type = "github";
-      owner = "Alexis211";
-      repo = "cargo2nix";
-      ref = "custom_unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+      };
     };
 
-    # use rust project builds 
-    fenix.url = "github:nix-community/fenix";
+    cargo2nix = {
+      url = "github:cargo2nix/cargo2nix";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        flake-utils.follows = "flake-utils";
+        rust-overlay.follows = "rust-overlay";
+      };
+    };
 
-    # import alba releasing tool
     albatros.url = "git+https://git.deuxfleurs.fr/Deuxfleurs/albatros.git?ref=main";
   };
 
-  outputs = { self, nixpkgs, cargo2nix, flake-utils, fenix, albatros }: 
-    let platformArtifacts = flake-utils.lib.eachSystem [
-      "x86_64-unknown-linux-musl"
-      "aarch64-unknown-linux-musl"
-      "armv6l-unknown-linux-musleabihf"
-    ] (targetHost: let
-    
-    # with fenix, we get builds from the rust project.
-    # they are done with an old version of musl (prior to 1.2.x that is used in NixOS),
-    # however musl has a breaking change from 1.1.x to 1.2.x on 32 bit systems.
-    # so we pin the lib to 1.1.x to avoid recompiling rust ourselves.
-    muslOverlay = self: super: {
-      musl = super.musl.overrideAttrs(old: if targetHost == "armv6l-unknown-linux-musleabihf" then rec {
-        pname = "musl";
-        version = "1.1.24";
-        src = builtins.fetchurl {
-          url    = "https://musl.libc.org/releases/${pname}-${version}.tar.gz";
-          sha256 = "sha256:18r2a00k82hz0mqdvgm7crzc7305l36109c0j9yjmkxj2alcjw0k";
+  outputs = { self, albatros, nixpkgs, cargo2nix, rust-overlay, flake-utils }:
+    flake-utils.lib.eachDefaultSystem(system:
+      let
+        ###
+        #
+        # --- INITIALIZATION ---
+        #
+        ###
+        pkgs = import nixpkgs { 
+          system = system;
+          overlays = [
+            cargo2nix.overlays.default
+          ];
         };
-      } else {});
-    };
 
-    pkgs = import nixpkgs { 
-      system = "x86_64-linux"; # hardcoded as we will cross compile
-      crossSystem = {
-        config = targetHost; # here we cross compile
-        isStatic = true;
-      };
-      overlays = [
-        cargo2nix.overlays.default
-        muslOverlay
-      ];
-    };
+        crossTargets = [
+          rec { llvm = "x86_64-unknown-linux-musl"; rust = llvm; go = "amd64"; }
+          rec { llvm = "aarch64-unknown-linux-musl"; rust = llvm; go = "arm64"; }
+          { llvm = "armv6l-unknown-linux-musleabihf"; rust = "arm-unknown-linux-musleabihf"; go = "arm"; }
+        ];
 
-    rustTarget = if targetHost == "armv6l-unknown-linux-musleabihf" then "arm-unknown-linux-musleabihf" else targetHost;
 
-    # release builds
-    rustRelease = pkgs.rustBuilder.makePackageSet({
-      packageFun = import ./Cargo.nix;
-      target = rustTarget;
-      release = true;
-      #rustcLinkFlags = [ "--cfg" "tokio_unstable" ];
-      #rustcBuildFlags = [ "--cfg" "tokio_unstable" ];
-      rustToolchain = with fenix.packages.x86_64-linux; combine [
-        minimal.cargo
-        minimal.rustc
-        targets.${rustTarget}.latest.rust-std
-      ];
-    });
-
-    # debug builds with clippy as the compiler (hack to speed up compilation)
-    debugBuildEnv = (drv:
-    ''
-        ${drv.setBuildEnv or ""}
-        echo
-        echo --- BUILDING WITH CLIPPY ---
-        echo
-
-        export NIX_RUST_BUILD_FLAGS="''${NIX_RUST_BUILD_FLAGS} --deny warnings"
-        export NIX_RUST_LINK_FLAGS="''${NIX_RUST_LINK_FLAGS} --deny warnings"
-        export RUSTC="''${CLIPPY_DRIVER}"
-    '');
-
-    rustDebug = pkgs.rustBuilder.makePackageSet({
-      packageFun = import ./Cargo.nix;
-      target = rustTarget;
-      release = false;
-      rustToolchain = with fenix.packages.x86_64-linux; combine [
-        default.cargo
-        default.rustc
-        default.clippy
-        targets.${rustTarget}.latest.rust-std
-      ];
-      packageOverrides = pkgs: pkgs.rustBuilder.overrides.all ++ [
-        (pkgs.rustBuilder.rustLib.makeOverride {
-          name = "aerogramme";
-          overrideAttrs = drv: {
-            setBuildEnv = (debugBuildEnv drv);
+        ###
+        #
+        # ---- CROSS COMPILATION ---
+        #
+        ###
+        cross = builtins.listToAttrs (map (triple: let
+          # [i] isStatic is mandatory in our knowledge to get final rust binaries that do not depend on a linker
+          # They also have a drawback we are aware of: it requires to recompile a C/C++ toolchain from scratch
+          pkgsCross = import nixpkgs {
+            system = system;
+            overlays = [
+              cargo2nix.overlays.default 
+            ];
+            crossSystem = {
+              config = triple.llvm; # here we cross compile
+              isStatic = true; # make sure resulting binary do not reference any linker
+            };
           };
-        })
-        (pkgs.rustBuilder.rustLib.makeOverride {
-          name = "smtp-message";
-          overrideAttrs = drv: {
-            /*setBuildEnv = (traceBuildEnv drv);
-            propagatedBuildInputs = drv.propagatedBuildInputs or [ ] ++ [
-              traceRust    
-            ];*/
+
+          # [i] All the patches to disable LTO that fails compilation
+          k2vManifest = drv: drv.overrideCargoManifest + ''
+# Rewrite Cargo.toml to disable LTO in release mode
+# LTO breaks our build system with errors like "undefined reference to alloc::sync::Arc::<_>::drop_slow"
+cat > Cargo.toml <<EOF
+[workspace]
+resolver = "2"
+members = ["src/k2v-client/"]
+EOF
+'';
+
+          smtpMessageManifest = drv: drv.overrideCargoManifest + ''
+# Rewrite Cargo.toml to disable LTO in release mode
+# LTO breaks our build system with errors like "undefined reference to alloc::sync::Arc::<_>::drop_slow"
+cat > Cargo.toml <<EOF
+[workspace]
+members = ["smtp-message/"]
+EOF
+'';
+
+
+          smtpServerManifest = drv: drv.overrideCargoManifest + ''
+# Rewrite Cargo.toml to disable LTO in release mode
+# LTO breaks our build system with errors like "undefined reference to alloc::sync::Arc::<_>::drop_slow
+cat > Cargo.toml <<EOF
+[workspace]
+members = ["smtp-server/"]
+EOF
+'';
+
+          # [i] Cargo2nix build declaration
+          project = pkgsCross.rustBuilder.makePackageSet({
+            packageFun = import ./Cargo.nix;
+            target = triple.rust;
+            release = true;
+            rustChannel = "nightly";
+            packageOverrides = pkgs: pkgs.rustBuilder.overrides.all ++ [
+              (pkgs.rustBuilder.rustLib.makeOverride {
+                name = "smtp-message";
+                overrideAttrs = drv: {
+                    overrideCargoManifest = smtpMessageManifest drv;
+                };
+              })
+              (pkgs.rustBuilder.rustLib.makeOverride {
+                name = "smtp-server";
+                overrideAttrs = drv: {
+                    overrideCargoManifest = smtpServerManifest drv;
+                };
+              })
+              (pkgs.rustBuilder.rustLib.makeOverride {
+                name = "k2v-client";
+                overrideAttrs = drv: {
+                    overrideCargoManifest = k2vManifest drv;
+                };
+              })
+              (pkgs.rustBuilder.rustLib.makeOverride {
+                name = "aws-lc-sys";
+                overrideAttrs = drv: {
+                  nativeBuildInputs = drv.nativeBuildInputs or [] ++ (if triple.go == "arm" then [ 
+                    # On armv6l, cmake and bindgen-cli are required.
+                    pkgs.cmake
+                    pkgs.rust-bindgen # fixup phase of pkgs.rustc on doc folder is slow (10+min) here. We might want to rewrite/skip it.
+                  ] else [
+                    # On aarch64 and amd64, it seems aws-lc-sys has vendored some code it needs
+                    # We skip injecting these dependencies to make builds faster
+                  ]);
+                };
+              })
+            ];
+          });
+      
+          # [i] Build final objects, all derivating from the cargo2nix decl
+          crate = (project.workspace.aerogramme {});
+
+          # [i] For static builds
+	  bin = pkgs.stdenv.mkDerivation {
+	    # volontarily break the dependency chain between crate
+	    # and the rest of the nix ecosystem as we know our binary
+	    # is statically compiled and thus the deps chain wrong.
+            pname = "${crate.name}-bin";
+            version = crate.version;
+	    nativeBuildInputs = [ pkgs.removeReferencesTo ];
+            dontUnpack = true;
+            dontBuild = true;
+            installPhase = ''
+              cp ${crate.bin}/bin/aerogramme $out
+	      remove-references-to -t ${project.rustToolchain} $out
+            '';
           };
-        })
-      ];
-    });
+
+	  # [i] For container builds.
+          # We add nix PKI root for HTTPS clients
+	  fhs = pkgs.stdenv.mkDerivation {
+            pname = "${crate.name}-fhs";
+            version = crate.version;
+	    nativeBuildInputs = [ pkgs.removeReferencesTo ];
+            dontUnpack = true;
+            dontBuild = true;
+            installPhase = ''
+              mkdir -p $out/bin
+              cp ${crate.bin}/bin/aerogramme $out/bin/
+	      remove-references-to -t ${project.rustToolchain} $out/bin/aerogramme
+              cp -r ${pkgsCross.cacert}/etc $out/
+            '';
+          };
+
+          container = pkgs.dockerTools.buildImage {
+            name = "dxflrs/aerogramme";
+            architecture = triple.go;
+            copyToRoot = fhs;
+            config = {
+              Entrypoint = "/bin/aerogramme";
+              Cmd = [ "--dev" "provider" "daemon" ];
+            };
+          };
 
 
-    crate = (rustRelease.workspace.aerogramme {});
+          in
+          { 
+            # [i] Final "cross" object is built here:
+            # only some of the created objects are exposed
+            name = triple.go;
+            value = rec {
+              inherit crate bin container;
+              default = bin;
+            };
+          }
+        ) crossTargets);
 
-    # binary extract
-    bin = pkgs.stdenv.mkDerivation {
-      pname = "${crate.name}-bin";
-      version = crate.version;
-      dontUnpack = true;
-      dontBuild = true;
-      installPhase = ''
-        cp ${crate.bin}/bin/aerogramme $out
-      '';
-    };
+        ###
+        #
+        # --- RELEASE TOOLING ---
+        # expected to be call with nix run .#tools.build and nix run .#tools.push
+        ###
+        tools = rec {
+          version = cross.amd64.crate.version; # bind version on amd64 crate
+	  alba = albatros.packages.alba;
+          build = pkgs.writeScriptBin "aerogramme-build" ''
+#!/usr/bin/env bash
+set -euxo pipefail
 
-    # fhs extract
-    fhs = pkgs.stdenv.mkDerivation {
-      pname = "${crate.name}-fhs";
-      version = crate.version;
-      dontUnpack = true;
-      dontBuild = true;
-      installPhase = ''
-      	mkdir -p $out/bin
-        cp ${crate.bin}/bin/aerogramme $out/bin/
-      '';
-    };
+# static
+nix build --print-build-logs .#cross.amd64.bin -o static/linux/amd64/aerogramme
+nix build --print-build-logs .#cross.arm64.bin -o static/linux/arm64/aerogramme
+nix build --print-build-logs .#cross.arm.bin   -o static/linux/arm/aerogramme
 
-    # docker packaging
-    archMap = {
-      "x86_64-unknown-linux-musl" = {
-        GOARCH = "amd64";
-      };
-      "aarch64-unknown-linux-musl" = {
-        GOARCH = "arm64";
-      };
-      "armv6l-unknown-linux-musleabihf" = {
-        GOARCH = "arm";
-      };
-    };
-    container = pkgs.dockerTools.buildImage {
-      name = "dxflrs/aerogramme";
-      architecture = (builtins.getAttr targetHost archMap).GOARCH;
-      copyToRoot = fhs;
-      config = {
-      	Env = [ "PATH=/bin" ];
-        Cmd = [ "aerogramme" "--dev" "provider" "daemon" ];
-      };
-    };
-
-    in {
-      meta = {
-        version = crate.version;
-      };
-      packages = {
-        inherit fhs container;
-        debug = (rustDebug.workspace.aerogramme {}).bin;
-        aerogramme = bin;
-        default = self.packages.${targetHost}.aerogramme;
-      };
-    });
-
-    ###
-    #
-    # RELEASE STUFF
-    #
-    ###
-    gpkgs = import nixpkgs {
-      system = "x86_64-linux"; # hardcoded as we will cross compile
-    };
-    alba = albatros.packages.x86_64-linux.alba;
-
-    # Shell
-    shell = gpkgs.mkShell {
-      buildInputs = [
-        gpkgs.openssl
-        gpkgs.pkg-config
-        cargo2nix.packages.x86_64-linux.default
-        fenix.packages.x86_64-linux.complete.toolchain
-        #fenix.packages.x86_64-linux.rust-analyzer
-      ];
-      shellHook = ''
-        echo "AEROGRAME DEVELOPMENT SHELL ${fenix.packages.x86_64-linux.complete.toolchain}"
-        export RUST_SRC_PATH="${fenix.packages.x86_64-linux.complete.toolchain}/lib/rustlib/src/rust/library"
-        export RUST_ANALYZER_INTERNALS_DO_NOT_USE='this is unstable'
-      '';
-    };
-
-    # Used only to fetch the "version"
-    version = platformArtifacts.meta.x86_64-unknown-linux-musl.version;
-
-    build = gpkgs.writeScriptBin "aerogramme-build" ''
-        set -euxo pipefail
-
-        # static
-        nix build --print-build-logs .#packages.x86_64-unknown-linux-musl.aerogramme  -o static/linux/amd64/aerogramme
-        nix build --print-build-logs .#packages.aarch64-unknown-linux-musl.aerogramme -o static/linux/arm64/aerogramme
-        nix build --print-build-logs .#packages.armv6l-unknown-linux-musleabihf.aerogramme  -o static/linux/arm/aerogramme
-
-        # containers
-        nix build --print-build-logs .#packages.x86_64-unknown-linux-musl.container  -o docker/linux.amd64.tar.gz
-        nix build --print-build-logs .#packages.aarch64-unknown-linux-musl.container -o docker/linux.arm64.tar.gz
-        nix build --print-build-logs .#packages.armv6l-unknown-linux-musleabihf.container  -o docker/linux.arm.tar.gz
+# containers
+nix build --print-build-logs .#cross.amd64.container -o docker/linux.amd64.tar.gz
+nix build --print-build-logs .#cross.arm64.container -o docker/linux.arm64.tar.gz
+nix build --print-build-logs .#cross.arm.container   -o docker/linux.arm.tar.gz
         '';
 
-    push = gpkgs.writeScriptBin "aerogramme-publish" ''
-        set -euxo pipefail
+        push = pkgs.writeScriptBin "aerogramme-publish" ''
+#!/usr/bin/env bash
+set -euxo pipefail
 
-        ${alba} static push -t aerogramme:${version} static/ 's3://download.deuxfleurs.org?endpoint=garage.deuxfleurs.fr&s3ForcePathStyle=true&region=garage' 1>&2
-        ${alba} container push -t aerogramme:${version} docker/ 's3://registry.deuxfleurs.org?endpoint=garage.deuxfleurs.fr&s3ForcePathStyle=true&region=garage' 1>&2
-        ${alba} container push -t aerogramme:${version} docker/ "docker://docker.io/dxflrs/aerogramme:${version}" 1>&2
+${alba} static push -t aerogramme:${version} static/ 's3://download.deuxfleurs.org?endpoint=garage.deuxfleurs.fr&s3ForcePathStyle=true&region=garage' 1>&2
+${alba} container push -t aerogramme:${version} docker/ 's3://registry.deuxfleurs.org?endpoint=garage.deuxfleurs.fr&s3ForcePathStyle=true&region=garage' 1>&2
+${alba} container push -t aerogramme:${version} docker/ "docker://docker.io/dxflrs/aerogramme:${version}" 1>&2
         '';
 
-    in
-    {
-        devShells.x86_64-linux.default = shell;
-        packages = {
-          x86_64-linux = {
-            inherit build push;
+
+        };
+
+	shell = pkgs.mkShell {
+          buildInputs = [
+            pkgs.openssl
+            pkgs.pkg-config
+	    pkgs.rust-bin.nightly.latest.default
+          ];
+        };
+
+      in
+        {
+          meta = {
+            version = tools.version; 
           };
-        } // platformArtifacts.packages;
-    };
+
+	  devShells.default = shell;
+
+          packages = {
+            inherit cross tools;
+          };
+        }
+    );
 }

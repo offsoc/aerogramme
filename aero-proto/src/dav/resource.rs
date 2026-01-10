@@ -792,6 +792,7 @@ impl DavNode for EventNode {
                 .etag()
                 .await
                 .ok_or(std::io::Error::new(std::io::ErrorKind::Other, "Etag error"))?;
+
             match policy {
                 PutPolicy::CreateOnly => {
                     return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
@@ -810,7 +811,7 @@ impl DavNode for EventNode {
                 .read_to_end(&mut evt)
                 .await
                 .or(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))?;
-            let (_token, entry) = self
+            let (_token, (_, _, etag)) = self
                 .col
                 .put(self.filename.as_str(), evt.as_ref())
                 .await
@@ -819,7 +820,7 @@ impl DavNode for EventNode {
                 .opportunistic_sync()
                 .await
                 .or(Err(std::io::ErrorKind::ConnectionReset))?;
-            Ok(entry.2)
+            Ok(etag)
         }
         .boxed()
     }
@@ -950,7 +951,7 @@ impl DavNode for CreateEventNode {
             let mut evt = Vec::new();
             let mut reader = stream.into_async_read();
             reader.read_to_end(&mut evt).await.unwrap();
-            let (_token, entry) = self
+            let (_token, (_, _, etag)) = self
                 .col
                 .put(self.filename.as_str(), evt.as_ref())
                 .await
@@ -959,7 +960,7 @@ impl DavNode for CreateEventNode {
                 .opportunistic_sync()
                 .await
                 .or(Err(std::io::ErrorKind::ConnectionReset))?;
-            Ok(entry.2)
+            Ok(etag)
         }
         .boxed()
     }

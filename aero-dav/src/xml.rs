@@ -1,4 +1,5 @@
 use futures::Future;
+use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
@@ -164,10 +165,18 @@ impl<T: IRead> Reader<T> {
                     self.next().await?
                 }
                 Event::Text(escaped) => {
-                    acc.push_str(escaped.unescape()?.as_ref());
+                    acc.push_str(escaped.xml_content()?.as_ref());
                     self.next().await?
                 }
                 Event::End(_) | Event::Start(_) | Event::Empty(_) => return Ok(acc),
+                Event::GeneralRef(maybe_char) => {
+                    if let Some(special_char) = maybe_char.resolve_char_ref()? {
+                        acc.push(special_char);
+                    } else if let Some(xml_ent_char) = resolve_predefined_entity(maybe_char.xml_content()?.as_ref()) {
+                        acc.push_str(xml_ent_char);
+                    }
+                    self.next().await?
+                }
                 _ => self.next().await?,
             };
         }
@@ -334,7 +343,7 @@ impl<T: IRead> Reader<T> {
         match &self.prev {
             Event::Start(bs) | Event::Empty(bs) => match bs.try_get_attribute(attr) {
                 Ok(Some(attr)) => attr
-                    .decode_and_unescape_value(&self.rdr)
+                    .decode_and_unescape_value(self.rdr.decoder())
                     .ok()
                     .map(|v| v.into_owned()),
                 _ => None,
